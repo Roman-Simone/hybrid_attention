@@ -44,6 +44,8 @@ def parse_args():
     parser.add_argument('--eval_iters', type=int, default=20)
     parser.add_argument('--log_interval', type=int, default=10)
     parser.add_argument('--eval_only', action='store_true')
+    parser.add_argument('--tensorboard', action='store_true',
+                        help='Write TensorBoard metrics to out_dir/tensorboard.')
     # Model and batch sizes.
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--block_size', type=int, default=256)
@@ -155,6 +157,8 @@ def get_lr(step, args):
 
 def main():
     args = parse_args()
+    if args.tensorboard:
+        from torch.utils.tensorboard import SummaryWriter
     torch.manual_seed(args.seed)
     device_type = torch.device(args.device).type
     if device_type == 'cuda':
@@ -217,53 +221,66 @@ def main():
     print(f'Device: {args.device}; tokens per step: '
           f'{args.batch_size * args.block_size * args.gradient_accumulation_steps:,}')
 
-    # Evaluate at intervals and at the end; ckpt.pt always contains the latest state.
-    while True:
-        if step % args.eval_interval == 0 or step >= args.max_iters or args.eval_only:
-            losses = estimate_loss(model, data_dir, args, context)
-            print(f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-            if args.eval_only:
-                break
-            improved = losses['val'] < best_val_loss
-            best_val_loss = min(best_val_loss, losses['val'])
-            device_rng_state = None
-            if device_type == 'cuda':
-                device_rng_state = torch.cuda.get_rng_state_all()
-            elif device_type == 'mps':
-                device_rng_state = torch.mps.get_rng_state()
-            state = dict(model=raw_model.state_dict(), optimizer=optimizer.state_dict(),
-                         scaler=scaler.state_dict(), model_args=asdict(raw_model.config),
-                         iter_num=step, best_val_loss=best_val_loss, config=vars(args),
-                         rng_state=torch.get_rng_state(), device_type=device_type,
-                         device_rng_state=device_rng_state)
-            torch.save(state, args.out_dir / 'ckpt.pt')
-            if improved:
-                torch.save(state, args.out_dir / 'best.pt')
-            if step >= args.max_iters:
-                break
+    # On resume, hide events newer than the restored checkpoint.
+    log_context = (SummaryWriter(log_dir=str(args.out_dir / 'tensorboard'),
+                                 purge_step=step if checkpoint is not None else None)
+                   if args.tensorboard else nullcontext())
+    with log_context as writer:
+        # Evaluate at intervals and at the end; ckpt.pt always contains the latest state.
+        while True:
+            if step % args.eval_interval == 0 or step >= args.max_iters or args.eval_only:
+                losses = estimate_loss(model, data_dir, args, context)
+                print(f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+                if writer is not None:
+                    for split, loss in losses.items():
+                        writer.add_scalar(f'loss/{split}', loss, step)
+                    writer.flush()
+                if args.eval_only:
+                    break
+                improved = losses['val'] < best_val_loss
+                best_val_loss = min(best_val_loss, losses['val'])
+                device_rng_state = None
+                if device_type == 'cuda':
+                    device_rng_state = torch.cuda.get_rng_state_all()
+                elif device_type == 'mps':
+                    device_rng_state = torch.mps.get_rng_state()
+                state = dict(model=raw_model.state_dict(), optimizer=optimizer.state_dict(),
+                             scaler=scaler.state_dict(), model_args=asdict(raw_model.config),
+                             iter_num=step, best_val_loss=best_val_loss, config=vars(args),
+                             rng_state=torch.get_rng_state(), device_type=device_type,
+                             device_rng_state=device_rng_state)
+                torch.save(state, args.out_dir / 'ckpt.pt')
+                if improved:
+                    torch.save(state, args.out_dir / 'best.pt')
+                if step >= args.max_iters:
+                    break
 
-        start = time.perf_counter()
-        lr = get_lr(step, args)
-        for group in optimizer.param_groups:
-            group['lr'] = lr
-        optimizer.zero_grad(set_to_none=True)
-        train_loss = 0.0
-        for _ in range(args.gradient_accumulation_steps):
-            x, y = get_batch(data_dir, 'train', args)
-            with context:
-                _, loss = model(x, y)
-                loss = loss / args.gradient_accumulation_steps
-            train_loss += loss.item()
-            scaler.scale(loss).backward()
-        if args.grad_clip > 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        step += 1
-        if step % args.log_interval == 0:
-            elapsed = (time.perf_counter() - start) * 1000
-            print(f'step {step}: loss {train_loss:.4f}, lr {lr:.6g}, time {elapsed:.0f}ms')
+            start = time.perf_counter()
+            lr = get_lr(step, args)
+            for group in optimizer.param_groups:
+                group['lr'] = lr
+            optimizer.zero_grad(set_to_none=True)
+            train_loss = 0.0
+            for _ in range(args.gradient_accumulation_steps):
+                x, y = get_batch(data_dir, 'train', args)
+                with context:
+                    _, loss = model(x, y)
+                    loss = loss / args.gradient_accumulation_steps
+                train_loss += loss.item()
+                scaler.scale(loss).backward()
+            if args.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            step += 1
+            if step % args.log_interval == 0:
+                elapsed = (time.perf_counter() - start) * 1000
+                print(f'step {step}: loss {train_loss:.4f}, lr {lr:.6g}, time {elapsed:.0f}ms')
+                if writer is not None:
+                    writer.add_scalar('loss/batch', train_loss, step)
+                    writer.add_scalar('learning_rate', lr, step)
+                    writer.add_scalar('time/step_ms', elapsed, step)
 
 
 if __name__ == '__main__':
