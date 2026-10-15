@@ -11,6 +11,9 @@ import torch.nn as nn
 from dataclasses import dataclass
 from torch.nn import functional as F
 
+from attention import (CausalSelfAttention, MLA, MLACache, MLALayerCache,
+                       RMSNorm, SlidingWindowAttention, build_attention)
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -22,226 +25,6 @@ class LayerNorm(nn.Module):
 
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
-
-class CausalSelfAttention(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
-
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
-        return normalized.to(x.dtype) * self.weight
-
-@dataclass
-class MLALayerCache:
-    latent: torch.Tensor
-    rope_key: torch.Tensor
-
-@dataclass
-class MLACache:
-    layers: list[MLALayerCache]
-    length: int
-
-class MLA(nn.Module):
-    """
-    Multi-head Latent Attention (MLA) with joint KV compression and decoupled RoPE.
-
-    Training: reconstructs per-head keys and values from compressed KV latents.
-    Inference: uses compressed KV caching and matrix absorption to avoid
-    explicitly reconstructing keys and values for previous tokens.
-    """
-
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.rank = config.kv_lora_rank
-        self.nope_dim = config.qk_nope_head_dim
-        self.rope_dim = config.qk_rope_head_dim
-        self.value_dim = config.v_head_dim
-        self.qk_dim = self.nope_dim + self.rope_dim
-        self.dropout = config.dropout
-
-        # Project queries for all attention heads.
-        self.wq = nn.Linear(self.n_embd, self.n_head * self.qk_dim, bias=False)
-
-        # Compress KV into a shared latent and produce positional keys for RoPE.
-        self.wkv_a = nn.Linear(self.n_embd, self.rank + self.rope_dim, bias=False)
-
-        # Normalize compressed KV representations for training stability.
-        self.kv_norm = RMSNorm(self.rank)
-
-        # Reconstruct content keys and values for all attention heads.
-        self.wkv_b = nn.Linear(self.rank, self.n_head * (self.nope_dim + self.value_dim), bias=False)
-
-        # Combine attention head outputs and project back to embedding size.
-        self.c_proj = nn.Linear(self.n_head * self.value_dim, self.n_embd, bias=config.bias)
-        self.resid_dropout = nn.Dropout(self.dropout)
-
-        # Precompute inverse frequencies for Rotary Positional Embeddings.
-        self.register_buffer("inv_freq", 1.0 / (config.rope_theta ** (torch.arange(0, self.rope_dim, 2).float() / self.rope_dim)), persistent=False)
-
-    def _rope(self, x, start_pos):
-        """Apply rotary positional embeddings to pairs of adjacent dimensions."""
-
-        positions = torch.arange(start_pos, start_pos + x.size(1), device=x.device).float()
-        angles = positions[:, None] * self.inv_freq.float()[None, :]
-        cos = angles.cos()[None, :, None, :].to(x.dtype)
-        sin = angles.sin()[None, :, None, :].to(x.dtype)
-
-        # Rotate pairs of even and odd dimensions.
-        even, odd = x[..., 0::2], x[..., 1::2]
-        return torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1).flatten(-2)
-
-    def _project(self, x, start_pos):
-        """
-        Project queries and compress KV representations.
-        Separate content and positional components for decoupled RoPE.
-        """
-
-        B, T, C = x.size()
-
-        # Project queries for all heads and separate content and positional parts.
-        q = self.wq(x).view(B, T, self.n_head, self.qk_dim)
-        q_content, q_rope = q.split((self.nope_dim, self.rope_dim), dim=-1)
-
-        # Compress KV into one shared latent per token and extract positional keys.
-        kv_latent, k_rope = self.wkv_a(x).split((self.rank, self.rope_dim), dim=-1)
-
-        # Apply RoPE only to positional components.
-        q_rope = self._rope(q_rope, start_pos)
-        k_rope = self._rope(k_rope.unsqueeze(2), start_pos).squeeze(2)
-        kv_latent = self.kv_norm(kv_latent)
-
-        return q_content, q_rope, kv_latent, k_rope
-
-    def forward(self, x):
-        """
-        Training forward pass: reconstruct keys and values from KV latents,
-        then compute causal scaled dot-product attention.
-        """
-
-        B, T, C = x.size()
-        q_content, q_rope, kv_latent, k_rope = self._project(x, 0)
-
-        # Reconstruct content keys and values for all heads.
-        kv = self.wkv_b(kv_latent).view(B, T, self.n_head, self.nope_dim + self.value_dim)
-        k_content, v = kv.split((self.nope_dim, self.value_dim), dim=-1)
-
-        # Combine content and positional components of queries and keys.
-        q = torch.cat((q_content, q_rope), dim=-1).transpose(1, 2)
-
-        # Positional keys are shared across all attention heads.
-        k_rope = k_rope.unsqueeze(2).expand(-1, -1, self.n_head, -1)
-        k = torch.cat((k_content, k_rope), dim=-1).transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        # Causal self-attention:
-        # q, k: (B, n_head, T, qk_dim)
-        # v:    (B, n_head, T, value_dim)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=self.dropout if self.training else 0.0)
-
-        # Reassemble attention heads and project to embedding dimension.
-        y = y.transpose(1, 2).contiguous()
-        return self.resid_dropout(self.c_proj(y.flatten(2)))
-
-    def forward_cached(self, x, cache, start_pos):
-        """
-        MLA inference with compressed KV caching and matrix absorption.
-
-        Compute attention directly on compressed latents without
-        reconstructing full keys and values for previous tokens.
-        """
-
-        B, T, C = x.size()
-        q_content, q_rope, kv_latent, k_rope = self._project(x, start_pos)
-
-        # Append new compressed KV representations to the cache.
-        if cache is not None:
-            kv_latent = torch.cat((cache.latent, kv_latent), dim=1)
-            k_rope = torch.cat((cache.rope_key, k_rope), dim=1)
-
-        # Separate key and value projection weights for each head.
-        kv_weights = self.wkv_b.weight.view(self.n_head, self.nope_dim + self.value_dim, self.rank)
-        k_weights = kv_weights[:, :self.nope_dim]
-        v_weights = kv_weights[:, self.nope_dim:]
-
-        # Matrix absorption: project queries into latent space instead of expanding keys.
-        q_latent = torch.einsum("bthd,hdr->bthr", q_content, k_weights)
-
-        # Compute content and positional attention scores.
-        content_scores = torch.einsum("bthr,bsr->bhts", q_latent, kv_latent)
-        position_scores = torch.einsum("bthd,bsd->bhts", q_rope, k_rope)
-        scores = (content_scores + position_scores) * (self.qk_dim ** -0.5)
-
-        # Causal mask: prevent attention to future tokens.
-        query_pos = start_pos + torch.arange(T, device=x.device)
-        key_pos = torch.arange(kv_latent.size(1), device=x.device)
-        scores = scores.masked_fill(key_pos[None, :] > query_pos[:, None], float("-inf"))
-
-        # Convert attention scores into probabilities.
-        probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(x.dtype)
-
-        # Aggregate compressed KV latents using attention probabilities.
-        aggregated = torch.einsum("bhts,bsr->bthr", probs, kv_latent)
-
-        # Apply value projection only after latent aggregation.
-        y = torch.einsum("bthr,hdr->bthd", aggregated, v_weights)
-
-        # Combine attention heads and return the updated compressed KV cache.
-        return self.resid_dropout(self.c_proj(y.flatten(2))), MLALayerCache(kv_latent, k_rope)
-
 
 class MLP(nn.Module):
 
@@ -264,7 +47,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config) if config.attention_type == 'mha' else MLA(config)
+        self.attn = build_attention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -283,6 +66,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     attention_type: str = 'mha'
+    sliding_window: int = 256 # maximum visible tokens per layer, including the current token
     kv_lora_rank: int = None
     qk_nope_head_dim: int = None
     qk_rope_head_dim: int = None
@@ -290,8 +74,8 @@ class GPTConfig:
     rope_theta: float = 10000.0
 
     def __post_init__(self):
-        if self.attention_type not in ('mha', 'mla'):
-            raise ValueError('attention_type must be mha or mla')
+        if self.attention_type not in ('mha', 'mla', 'swa'):
+            raise ValueError('attention_type must be mha, mla or swa')
         for name in ('n_layer', 'n_head', 'n_embd', 'block_size', 'vocab_size'):
             if getattr(self, name) <= 0:
                 raise ValueError(f'{name} must be positive')
@@ -299,6 +83,9 @@ class GPTConfig:
             raise ValueError('n_embd must be divisible by n_head')
         if not 0 <= self.dropout < 1:
             raise ValueError('dropout must be in [0, 1)')
+        if self.attention_type == 'swa':
+            if not isinstance(self.sliding_window, int) or self.sliding_window <= 0:
+                raise ValueError('sliding_window must be a positive integer')
         if self.attention_type == 'mla':
             head_dim = self.n_embd // self.n_head
             defaults = dict(kv_lora_rank=max(1, self.n_embd // 4), qk_nope_head_dim=head_dim,
@@ -323,7 +110,7 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            **({'wpe': nn.Embedding(config.block_size, config.n_embd)} if config.attention_type == 'mha' else {}),
+            **({'wpe': nn.Embedding(config.block_size, config.n_embd)} if config.attention_type in ('mha', 'swa') else {}),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),

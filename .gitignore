@@ -4,6 +4,7 @@
 *.pt
 *.txt
 /reference/nanoGPT
+out/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
