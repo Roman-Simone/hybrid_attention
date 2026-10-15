@@ -3,6 +3,7 @@
 *.pkl
 *.pt
 *.txt
+/reference/nanoGPT
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -37,7 +37,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     # Data and checkpoints.
-    parser.add_argument('--dataset', required=True). # ex: 'shakespeare_char'
+    parser.add_argument('--dataset', required=True) # ex: 'shakespeare_char'
     parser.add_argument('--out_dir', type=Path, default=Path('out'))
     parser.add_argument('--init_from', choices=['scratch', 'resume'], default='scratch')
     parser.add_argument('--eval_interval', type=int, default=250)
@@ -51,6 +51,10 @@ def parse_args():
     parser.add_argument('--n_layer', type=int, default=6)
     parser.add_argument('--n_head', type=int, default=6)
     parser.add_argument('--n_embd', type=int, default=384)
+    parser.add_argument('--attention_type', choices=['mha', 'mla'], default='mha')
+    for name in ('kv_lora_rank', 'qk_nope_head_dim', 'qk_rope_head_dim', 'v_head_dim'):
+        parser.add_argument(f'--{name}', type=int, default=None)
+    parser.add_argument('--rope_theta', type=float, default=10000.0)
     parser.add_argument('--vocab_size', type=int, default=None,
                         help='Override meta.pkl; defaults to 50304 when metadata is absent.')
     parser.add_argument('--dropout', type=float, default=0.2)
@@ -176,7 +180,11 @@ def main():
                 vocab_size = 50304
         model_args = dict(n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd,
                           block_size=args.block_size, vocab_size=vocab_size,
-                          dropout=args.dropout, bias=args.bias)
+                          dropout=args.dropout, bias=args.bias,
+                          attention_type=args.attention_type, kv_lora_rank=args.kv_lora_rank,
+                          qk_nope_head_dim=args.qk_nope_head_dim,
+                          qk_rope_head_dim=args.qk_rope_head_dim,
+                          v_head_dim=args.v_head_dim, rope_theta=args.rope_theta)
     for split in ('train', 'val'):
         path = data_dir / f'{split}.bin'
         if not path.exists():

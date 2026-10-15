@@ -1,8 +1,8 @@
 """
 The code take inspiration from the code creaated from these three repo:
-- https://github.com/deepseek-ai/DeepSeek-V3.git
-- https://github.com/mistralai/mistral-inference.git
-- https://github.com/karpathy/nanoGPT.git 
+- https://github.com/deepseek-ai/DeepSeek-V3.git - nanoGPT
+- https://github.com/mistralai/mistral-inference.git - for SLA
+- https://github.com/karpathy/nanoGPT.git - for MLA
 """
 import inspect
 import math
@@ -72,6 +72,177 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
+        return normalized.to(x.dtype) * self.weight
+
+@dataclass
+class MLALayerCache:
+    latent: torch.Tensor
+    rope_key: torch.Tensor
+
+@dataclass
+class MLACache:
+    layers: list[MLALayerCache]
+    length: int
+
+class MLA(nn.Module):
+    """
+    Multi-head Latent Attention (MLA) with joint KV compression and decoupled RoPE.
+
+    Training: reconstructs per-head keys and values from compressed KV latents.
+    Inference: uses compressed KV caching and matrix absorption to avoid
+    explicitly reconstructing keys and values for previous tokens.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.rank = config.kv_lora_rank
+        self.nope_dim = config.qk_nope_head_dim
+        self.rope_dim = config.qk_rope_head_dim
+        self.value_dim = config.v_head_dim
+        self.qk_dim = self.nope_dim + self.rope_dim
+        self.dropout = config.dropout
+
+        # Project queries for all attention heads.
+        self.wq = nn.Linear(self.n_embd, self.n_head * self.qk_dim, bias=False)
+
+        # Compress KV into a shared latent and produce positional keys for RoPE.
+        self.wkv_a = nn.Linear(self.n_embd, self.rank + self.rope_dim, bias=False)
+
+        # Normalize compressed KV representations for training stability.
+        self.kv_norm = RMSNorm(self.rank)
+
+        # Reconstruct content keys and values for all attention heads.
+        self.wkv_b = nn.Linear(self.rank, self.n_head * (self.nope_dim + self.value_dim), bias=False)
+
+        # Combine attention head outputs and project back to embedding size.
+        self.c_proj = nn.Linear(self.n_head * self.value_dim, self.n_embd, bias=config.bias)
+        self.resid_dropout = nn.Dropout(self.dropout)
+
+        # Precompute inverse frequencies for Rotary Positional Embeddings.
+        self.register_buffer("inv_freq", 1.0 / (config.rope_theta ** (torch.arange(0, self.rope_dim, 2).float() / self.rope_dim)), persistent=False)
+
+    def _rope(self, x, start_pos):
+        """Apply rotary positional embeddings to pairs of adjacent dimensions."""
+
+        positions = torch.arange(start_pos, start_pos + x.size(1), device=x.device).float()
+        angles = positions[:, None] * self.inv_freq.float()[None, :]
+        cos = angles.cos()[None, :, None, :].to(x.dtype)
+        sin = angles.sin()[None, :, None, :].to(x.dtype)
+
+        # Rotate pairs of even and odd dimensions.
+        even, odd = x[..., 0::2], x[..., 1::2]
+        return torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1).flatten(-2)
+
+    def _project(self, x, start_pos):
+        """
+        Project queries and compress KV representations.
+        Separate content and positional components for decoupled RoPE.
+        """
+
+        B, T, C = x.size()
+
+        # Project queries for all heads and separate content and positional parts.
+        q = self.wq(x).view(B, T, self.n_head, self.qk_dim)
+        q_content, q_rope = q.split((self.nope_dim, self.rope_dim), dim=-1)
+
+        # Compress KV into one shared latent per token and extract positional keys.
+        kv_latent, k_rope = self.wkv_a(x).split((self.rank, self.rope_dim), dim=-1)
+
+        # Apply RoPE only to positional components.
+        q_rope = self._rope(q_rope, start_pos)
+        k_rope = self._rope(k_rope.unsqueeze(2), start_pos).squeeze(2)
+        kv_latent = self.kv_norm(kv_latent)
+
+        return q_content, q_rope, kv_latent, k_rope
+
+    def forward(self, x):
+        """
+        Training forward pass: reconstruct keys and values from KV latents,
+        then compute causal scaled dot-product attention.
+        """
+
+        B, T, C = x.size()
+        q_content, q_rope, kv_latent, k_rope = self._project(x, 0)
+
+        # Reconstruct content keys and values for all heads.
+        kv = self.wkv_b(kv_latent).view(B, T, self.n_head, self.nope_dim + self.value_dim)
+        k_content, v = kv.split((self.nope_dim, self.value_dim), dim=-1)
+
+        # Combine content and positional components of queries and keys.
+        q = torch.cat((q_content, q_rope), dim=-1).transpose(1, 2)
+
+        # Positional keys are shared across all attention heads.
+        k_rope = k_rope.unsqueeze(2).expand(-1, -1, self.n_head, -1)
+        k = torch.cat((k_content, k_rope), dim=-1).transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # Causal self-attention:
+        # q, k: (B, n_head, T, qk_dim)
+        # v:    (B, n_head, T, value_dim)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=self.dropout if self.training else 0.0)
+
+        # Reassemble attention heads and project to embedding dimension.
+        y = y.transpose(1, 2).contiguous()
+        return self.resid_dropout(self.c_proj(y.flatten(2)))
+
+    def forward_cached(self, x, cache, start_pos):
+        """
+        MLA inference with compressed KV caching and matrix absorption.
+
+        Compute attention directly on compressed latents without
+        reconstructing full keys and values for previous tokens.
+        """
+
+        B, T, C = x.size()
+        q_content, q_rope, kv_latent, k_rope = self._project(x, start_pos)
+
+        # Append new compressed KV representations to the cache.
+        if cache is not None:
+            kv_latent = torch.cat((cache.latent, kv_latent), dim=1)
+            k_rope = torch.cat((cache.rope_key, k_rope), dim=1)
+
+        # Separate key and value projection weights for each head.
+        kv_weights = self.wkv_b.weight.view(self.n_head, self.nope_dim + self.value_dim, self.rank)
+        k_weights = kv_weights[:, :self.nope_dim]
+        v_weights = kv_weights[:, self.nope_dim:]
+
+        # Matrix absorption: project queries into latent space instead of expanding keys.
+        q_latent = torch.einsum("bthd,hdr->bthr", q_content, k_weights)
+
+        # Compute content and positional attention scores.
+        content_scores = torch.einsum("bthr,bsr->bhts", q_latent, kv_latent)
+        position_scores = torch.einsum("bthd,bsd->bhts", q_rope, k_rope)
+        scores = (content_scores + position_scores) * (self.qk_dim ** -0.5)
+
+        # Causal mask: prevent attention to future tokens.
+        query_pos = start_pos + torch.arange(T, device=x.device)
+        key_pos = torch.arange(kv_latent.size(1), device=x.device)
+        scores = scores.masked_fill(key_pos[None, :] > query_pos[:, None], float("-inf"))
+
+        # Convert attention scores into probabilities.
+        probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(x.dtype)
+
+        # Aggregate compressed KV latents using attention probabilities.
+        aggregated = torch.einsum("bhts,bsr->bthr", probs, kv_latent)
+
+        # Apply value projection only after latent aggregation.
+        y = torch.einsum("bthr,hdr->bthd", aggregated, v_weights)
+
+        # Combine attention heads and return the updated compressed KV cache.
+        return self.resid_dropout(self.c_proj(y.flatten(2))), MLALayerCache(kv_latent, k_rope)
+
+
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -93,7 +264,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config) if config.attention_type == 'mha' else MLA(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -111,6 +282,36 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    attention_type: str = 'mha'
+    kv_lora_rank: int = None
+    qk_nope_head_dim: int = None
+    qk_rope_head_dim: int = None
+    v_head_dim: int = None
+    rope_theta: float = 10000.0
+
+    def __post_init__(self):
+        if self.attention_type not in ('mha', 'mla'):
+            raise ValueError('attention_type must be mha or mla')
+        for name in ('n_layer', 'n_head', 'n_embd', 'block_size', 'vocab_size'):
+            if getattr(self, name) <= 0:
+                raise ValueError(f'{name} must be positive')
+        if self.n_embd % self.n_head:
+            raise ValueError('n_embd must be divisible by n_head')
+        if not 0 <= self.dropout < 1:
+            raise ValueError('dropout must be in [0, 1)')
+        if self.attention_type == 'mla':
+            head_dim = self.n_embd // self.n_head
+            defaults = dict(kv_lora_rank=max(1, self.n_embd // 4), qk_nope_head_dim=head_dim,
+                            qk_rope_head_dim=head_dim // 2, v_head_dim=head_dim)
+            for name, default in defaults.items():
+                if getattr(self, name) is None:
+                    setattr(self, name, default)
+                if getattr(self, name) <= 0:
+                    raise ValueError(f'{name} must be positive')
+            if self.qk_rope_head_dim % 2:
+                raise ValueError('qk_rope_head_dim must be even')
+            if not math.isfinite(self.rope_theta) or self.rope_theta <= 0:
+                raise ValueError('rope_theta must be finite and positive')
 
 class GPT(nn.Module):
 
@@ -122,7 +323,7 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            **({'wpe': nn.Embedding(config.block_size, config.n_embd)} if config.attention_type == 'mha' else {}),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -152,7 +353,7 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
+        if non_embedding and 'wpe' in self.transformer:
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
@@ -172,7 +373,7 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        pos_emb = self.transformer.wpe(pos) if 'wpe' in self.transformer else 0
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
@@ -189,13 +390,46 @@ class GPT(nn.Module):
 
         return logits, loss
 
+    @torch.no_grad()
+    def forward_cached(self, idx, cache=None):
+        """Return all new-token logits and an explicit MLA cache in eval mode.
+
+        Cache belongs to this model and batch; discard it after changing weights,
+        device, dtype, or token history. Overflow requires a fresh window prefill.
+        """
+        if self.training or self.config.attention_type != 'mla':
+            raise ValueError('forward_cached requires an MLA model in eval mode')
+        if idx.ndim != 2 or idx.size(1) == 0:
+            raise ValueError('idx must be a nonempty (batch, time) tensor')
+        start_pos = 0 if cache is None else cache.length
+        if start_pos < 0 or start_pos + idx.size(1) > self.config.block_size:
+            raise ValueError('Cached context exceeds block_size; prefill a fresh window')
+        if cache is not None:
+            if len(cache.layers) != self.config.n_layer:
+                raise ValueError('Cache layer count does not match model')
+            for layer in cache.layers:
+                if (layer.latent.shape != (idx.size(0), start_pos, self.config.kv_lora_rank)
+                        or layer.rope_key.shape != (idx.size(0), start_pos, self.config.qk_rope_head_dim)
+                        or layer.latent.device != idx.device or layer.rope_key.device != idx.device):
+                    raise ValueError('Cache shape or device does not match input/model')
+        x = self.transformer.drop(self.transformer.wte(idx))
+        layers = []
+        for i, block in enumerate(self.transformer.h):
+            y, layer_cache = block.attn.forward_cached(
+                block.ln_1(x), None if cache is None else cache.layers[i], start_pos)
+            x = x + y
+            x = x + block.mlp(block.ln_2(x))
+            layers.append(layer_cache)
+        return self.lm_head(self.transformer.ln_f(x)), MLACache(layers, start_pos + idx.size(1))
+
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
         # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
         # but want to use a smaller block size for some smaller, simpler model
-        assert block_size <= self.config.block_size
+        assert 0 < block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        if 'wpe' in self.transformer:
+            self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
@@ -285,6 +519,8 @@ class GPT(nn.Module):
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+        if self.config.attention_type == 'mla':
+            raise NotImplementedError('The GPT-2 MFU estimate is not valid for MLA')
         # first estimate the number of flops we do per iteration.
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = self.get_num_params()
@@ -306,11 +542,18 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        cache = None
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            if self.config.attention_type == 'mla' and not self.training:
+                if cache is None or cache.length >= self.config.block_size:
+                    logits, cache = self.forward_cached(idx_cond)
+                else:
+                    logits, cache = self.forward_cached(idx[:, -1:], cache)
+            else:
+                logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
