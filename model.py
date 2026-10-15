@@ -74,8 +74,8 @@ class GPTConfig:
     rope_theta: float = 10000.0
 
     def __post_init__(self):
-        if self.attention_type not in ('mha', 'mla', 'swa'):
-            raise ValueError('attention_type must be mha, mla or swa')
+        if self.attention_type not in ('mha', 'mla', 'swa', 'hybrid'):
+            raise ValueError('attention_type must be mha, mla, swa or hybrid')
         for name in ('n_layer', 'n_head', 'n_embd', 'block_size', 'vocab_size'):
             if getattr(self, name) <= 0:
                 raise ValueError(f'{name} must be positive')
@@ -83,10 +83,10 @@ class GPTConfig:
             raise ValueError('n_embd must be divisible by n_head')
         if not 0 <= self.dropout < 1:
             raise ValueError('dropout must be in [0, 1)')
-        if self.attention_type == 'swa':
+        if self.attention_type in ('swa', 'hybrid'):
             if not isinstance(self.sliding_window, int) or self.sliding_window <= 0:
                 raise ValueError('sliding_window must be a positive integer')
-        if self.attention_type == 'mla':
+        if self.attention_type in ('mla', 'hybrid'):
             head_dim = self.n_embd // self.n_head
             defaults = dict(kv_lora_rank=max(1, self.n_embd // 4), qk_nope_head_dim=head_dim,
                             qk_rope_head_dim=head_dim // 2, v_head_dim=head_dim)
@@ -184,8 +184,8 @@ class GPT(nn.Module):
         Cache belongs to this model and batch; discard it after changing weights,
         device, dtype, or token history. Overflow requires a fresh window prefill.
         """
-        if self.training or self.config.attention_type != 'mla':
-            raise ValueError('forward_cached requires an MLA model in eval mode')
+        if self.training or self.config.attention_type not in ('mla', 'hybrid'):
+            raise ValueError('forward_cached requires an MLA or hybrid model in eval mode')
         if idx.ndim != 2 or idx.size(1) == 0:
             raise ValueError('idx must be a nonempty (batch, time) tensor')
         start_pos = 0 if cache is None else cache.length
@@ -194,9 +194,10 @@ class GPT(nn.Module):
         if cache is not None:
             if len(cache.layers) != self.config.n_layer:
                 raise ValueError('Cache layer count does not match model')
+            cache_length = min(start_pos, self.config.sliding_window) if self.config.attention_type == 'hybrid' else start_pos
             for layer in cache.layers:
-                if (layer.latent.shape != (idx.size(0), start_pos, self.config.kv_lora_rank)
-                        or layer.rope_key.shape != (idx.size(0), start_pos, self.config.qk_rope_head_dim)
+                if (layer.latent.shape != (idx.size(0), cache_length, self.config.kv_lora_rank)
+                        or layer.rope_key.shape != (idx.size(0), cache_length, self.config.qk_rope_head_dim)
                         or layer.latent.device != idx.device or layer.rope_key.device != idx.device):
                     raise ValueError('Cache shape or device does not match input/model')
         x = self.transformer.drop(self.transformer.wte(idx))
@@ -306,8 +307,8 @@ class GPT(nn.Module):
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        if self.config.attention_type == 'mla':
-            raise NotImplementedError('The GPT-2 MFU estimate is not valid for MLA')
+        if self.config.attention_type in ('mla', 'hybrid'):
+            raise NotImplementedError('The GPT-2 MFU estimate is not valid for MLA or hybrid')
         # first estimate the number of flops we do per iteration.
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
         N = self.get_num_params()
@@ -334,7 +335,7 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            if self.config.attention_type == 'mla' and not self.training:
+            if self.config.attention_type in ('mla', 'hybrid') and not self.training:
                 if cache is None or cache.length >= self.config.block_size:
                     logits, cache = self.forward_cached(idx_cond)
                 else:

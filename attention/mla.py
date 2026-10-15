@@ -99,6 +99,9 @@ class MLA(nn.Module):
 
         return q_content, q_rope, kv_latent, k_rope
 
+    def _attention_mask(self, query_pos, key_pos):
+        return key_pos[None, :] <= query_pos[:, None]
+
     def forward(self, x):
         """
         Training forward pass: reconstruct keys and values from KV latents,
@@ -123,7 +126,9 @@ class MLA(nn.Module):
         # Causal self-attention:
         # q, k: (B, n_head, T, qk_dim)
         # v:    (B, n_head, T, value_dim)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=self.dropout if self.training else 0.0)
+        pos = torch.arange(T, device=x.device)
+        mask = self._attention_mask(pos, pos)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.dropout if self.training else 0.0)
 
         # Reassemble attention heads and project to embedding dimension.
         y = y.transpose(1, 2).contiguous()
@@ -160,8 +165,10 @@ class MLA(nn.Module):
 
         # Causal mask: prevent attention to future tokens.
         query_pos = start_pos + torch.arange(T, device=x.device)
-        key_pos = torch.arange(kv_latent.size(1), device=x.device)
-        scores = scores.masked_fill(key_pos[None, :] > query_pos[:, None], float("-inf"))
+        key_start = start_pos + T - kv_latent.size(1)
+        key_pos = key_start + torch.arange(kv_latent.size(1), device=x.device)
+        mask = self._attention_mask(query_pos, key_pos)
+        scores = scores.masked_fill(~mask, float("-inf"))
 
         # Convert attention scores into probabilities.
         probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(x.dtype)

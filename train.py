@@ -51,9 +51,9 @@ def parse_args():
     parser.add_argument('--n_layer', type=int, default=6)
     parser.add_argument('--n_head', type=int, default=6)
     parser.add_argument('--n_embd', type=int, default=384)
-    parser.add_argument('--attention_type', choices=['mha', 'mla', 'swa'], default='mha')
+    parser.add_argument('--attention_type', choices=['mha', 'mla', 'swa', 'hybrid'], default='mha')
     parser.add_argument('--sliding_window', type=int, default=256,
-                        help='Visible tokens per SWA layer, including the current token.')
+                        help='Visible tokens per SWA or hybrid layer, including the current token.')
     for name in ('kv_lora_rank', 'qk_nope_head_dim', 'qk_rope_head_dim', 'v_head_dim'):
         parser.add_argument(f'--{name}', type=int, default=None)
     parser.add_argument('--rope_theta', type=float, default=10000.0)
@@ -89,7 +89,7 @@ def parse_args():
             parser.error(f'--{name} must be positive')
     if args.n_embd % args.n_head:
         parser.error('--n_embd must be divisible by --n_head')
-    if args.attention_type == 'swa' and args.sliding_window <= 0:
+    if args.attention_type in ('swa', 'hybrid') and args.sliding_window <= 0:
         parser.error('--sliding_window must be positive')
     if args.warmup_iters < 0 or (args.decay_lr and args.lr_decay_iters <= args.warmup_iters):
         parser.error('--lr_decay_iters must exceed --warmup_iters (which must be nonnegative)')
