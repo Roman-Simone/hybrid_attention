@@ -5,8 +5,10 @@
 *.txt
 /reference/nanoGPT
 out/
-esperimenti/
+experiments/*/
+!experiments/utils/
 AGENTS.md
+README copy.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

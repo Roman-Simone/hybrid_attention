@@ -23,10 +23,9 @@
     - [Language Modeling Performance](#language-modeling-performance)
     - [Inference Performance](#inference-performance)
     - [KV Cache Memory](#kv-cache-memory)
-  - [Key Findings](#key-findings)
-  - [Reproducibility](#reproducibility)
-  - [Limitations](#limitations)
+  - [Comment](#comment)
   - [References](#references)
+  - [Reproducibility](#reproducibility)
 
 ---
 
@@ -142,15 +141,6 @@ The implementation uses a KV latent dimension of **96** and a decoupled RoPE dim
 
 The proposed Hybrid Attention mechanism combines the memory compression of MLA with the local attention constraint of SWA.
 
-For each new token:
-
-1. The input hidden state is projected into Query and compressed KV representations.
-2. The compressed KV representation and positional Key component are added to the cache.
-3. Attention is computed over the tokens inside the local window.
-4. Tokens outside the window are removed from the persistent KV cache.
-5. The attention output is projected back into the Transformer hidden dimension.
-
-
 The following experiments investigate the practical benefits and computational overhead associated with this combination.
 
 ---
@@ -223,7 +213,7 @@ Three measurements were collected:
 - **Fixed-step latency:** time required for one decoding step with a fixed cache state.
 - **Sequential decode latency:** average time per token over 16 consecutive decoding steps.
 
-The following table compares the reference execution paths (SDPA for MHA/SWA, native for MLA/Hybrid) using an initial prompt length of 240 tokens. Values are medians from the [CPU benchmark campaign with four-token spacing](esperimenti/confronto_cpu_step4_20261018/report.md).
+The following table compares the reference execution paths (SDPA for MHA/SWA, native for MLA/Hybrid) using an initial prompt length of 240 tokens. Values are medians from the [CPU benchmark data](experiments/confronto_cpu_step4_20261018/benchmark.csv).
 
 | Model | Prefill (ms) ↓ | Decode (ms/token) ↓ | Decode throughput (tokens/s) ↑ |
 |---|---:|---:|---:|
@@ -243,34 +233,10 @@ In particular:
 The shaded bands show the interquartile range (IQR); overlapping ranges call for caution when interpreting small latency differences.
 
 <center>
-<img src="esperimenti/confronto_cpu_step4_20261018/figure/tempi_cpu.png" alt="Inference performance of MHA, MLA, SWA, and Hybrid on CPU, measured every four tokens" width="1000">
+<img src="figure/tempi_cpu.png" alt="Inference performance of MHA, MLA, SWA, and Hybrid on CPU, measured every four tokens" width="1000">
 
-*Figure 3. Inference performance of MHA, MLA, SWA, and Hybrid on the Apple M1 CPU (4 threads, batch size 1, float32). From left to right, the panels show prefill latency, single-token latency with a fixed cache, and average latency per token over 16 consecutive decoding steps. Prompt lengths are sampled every 4 tokens from 16 to 240. Lines connect measured medians and shaded bands show the interquartile range. The vertical dotted line marks the 64-token local attention window; it does not indicate a shared execution switch. At 240 tokens, SWA has the lowest median prefill and decoding latency, while Hybrid has a lower median decoding latency than MHA and MLA.
-Source: [CPU benchmark campaign with four-token spacing](esperimenti/confronto_cpu_step4_20261018/report.md).*
+*Figure 3. Inference performance of MHA, MLA, SWA, and Hybrid on the Apple M1 CPU (4 threads, batch size 1, float32). From left to right, the panels show prefill latency, single-token latency with a fixed cache, and average latency per token over 16 consecutive decoding steps. Prompt lengths are sampled every 4 tokens from 16 to 240. Lines connect measured medians and shaded bands show the interquartile range. The dotted line marks the 64-token window. At 240 tokens, SWA has the lowest median prefill and decode latency.*
 </center>
-
-#### End-to-end autoregressive generation (MPS)
-
-The CPU results above are isolated decode measurements. A separate benchmark measured complete free-running generation on the Apple M1 **MPS** backend, using the same trained checkpoints, float32, batch size 1, and greedy token selection. Prompt lengths were 32 and 128 tokens; each request generated 16, 64, 128, or 256 tokens. Each case had two warm-ups and 16 timed samples across four rounds.
-
-Unlike the isolated benchmark, this end-to-end measurement includes prompt tokenization and transfer, prefill, token selection, autoregressive feedback, cache maintenance, and final text decoding. Time to first token (TTFT) ends when the first generated character is available on CPU after MPS synchronization. Throughput is generated tokens divided by total request time. The experiment uses a shared cached generation loop for all four models; it is distinct from the stock `GPT.generate` path, which recomputes full attention for MHA/SWA.
-
-The table shows results for a 128-token prompt. Values are medians; detailed results for both prompts and all generation lengths are in the [MPS generation CSV](esperimenti/extended_mps_20261018/generation.csv) and [experimental report](esperimenti/REPORT.md).
-
-| Model | New tokens | Total time (ms) ↓ | TTFT (ms) ↓ | Throughput (tokens/s) ↑ | Cache rebuilds |
-|---|---:|---:|---:|---:|---:|
-| MHA | 128 | 352.77 | 6.24 | 363.4 | 0 |
-| MLA | 128 | 1517.23 | 19.37 | 84.4 | 0 |
-| SWA | 128 | 310.15 | 5.96 | **412.7** | 0 |
-| Hybrid | 128 | 738.45 | 12.55 | 173.3 | 0 |
-
-<center>
-<img src="esperimenti/extended_mps_20261018/figure/generation.png" alt="End-to-end cached generation time, time to first token and throughput for four attention models on Apple M1 MPS" width="1000">
-
-*Figure 4. End-to-end greedy generation on Apple M1 MPS (float32, batch size 1), comparing total request time, TTFT, and throughput across output lengths for prompt lengths 32 and 128. Points show medians and bands show the interquartile range. These full-generation timings include prefill and output handling, so they are not directly comparable to the isolated CPU decode measurements above.*
-</center>
-
-All checkpoints have a context limit of 256 tokens. When prompt plus generated history exceeds that limit, the benchmark rebuilds the cache from the latest 256 tokens on subsequent steps. For a 128-token prompt and 256 generated tokens this causes 127 rebuilds; those results therefore describe context-reset generation and are not a measure of uninterrupted long-context decoding. See the [report](esperimenti/REPORT.md) for the complete methodology, limitations, and all measured configurations.
 
 ### KV Cache Memory
 
@@ -291,82 +257,35 @@ Compared with MHA, Hybrid requires **22.5× less KV cache memory** at this seque
 
 This reduction results from combining latent KV compression with a bounded sliding window.
 
-![KV Cache Memory](esperimenti/confronto_20261016/figure/memoria_contesto.png)
+![KV cache storage by prompt length and cross-entropy by available context for MHA, MLA, SWA, and Hybrid](figure/memoria_contesto_mps.png)
+
+*Figure 5. Left: persistent KV cache storage as prompt length increases. Right: cross-entropy on 128 fixed validation targets as available context grows; lower values indicate better language-modeling quality. The dotted line marks the 64-token attention window. Cache usage for SWA and Hybrid plateaus after the window fills, while MHA storage continues to grow with the prompt.*
 
 These values represent the persistent KV cache only, not the total memory consumption of the model.
 
 ---
 
-## Key Findings
+## Comment
 
-The experiments highlight three main observations.
+The experiments show that SWA and MLA can substantially reduce KV cache memory while maintaining language modeling quality close to the MHA baseline on the evaluated dataset. Combining the two mechanisms provides the largest memory savings, making Hybrid Attention a promising approach for inference under limited memory budgets.
 
-**1. Hybrid Attention significantly reduces KV cache memory.**
+However, these savings do not automatically translate into faster inference. In the current implementation, MLA and Hybrid have higher prefill latency than MHA and SWA, although both achieve lower median decoding latency than MHA at 240 tokens. This overhead may partly reflect limitations in the implementation and backend optimization.
 
-Combining MLA compression with a sliding window provides a substantial reduction in persistent KV cache storage.
+The main advantages and drawbacks observed in these experiments are:
 
-At a prompt length of 240 tokens, Hybrid uses 192 KiB compared with 4320 KiB for standard MHA.
+**Pros**
 
-**2. Memory efficiency and inference speed are different objectives.**
+- **Lower KV cache memory:** combining latent compression and a sliding window reduces cache storage by a factor of 22.5 compared with MHA at 240 tokens.
+- **Comparable modeling quality:** validation metrics remain close to the baseline on Shakespeare character-level data.
+- **Bounded cache growth:** SWA and Hybrid stop accumulating cached tokens once the attention window is full.
 
-Although Hybrid achieves the smallest KV cache, it does not achieve the lowest decoding latency.
+**Cons**
 
-The compressed attention computation introduces additional operations whose cost depends on the implementation and hardware backend.
+- **Small quality tradeoff:** the alternative architectures achieve slightly worse validation metrics than MHA in the reported comparison.
+- **Higher prefill latency:** MLA-based models take longer to process the initial prompt in the current implementation.
+- **Implementation-dependent speed:** smaller caches alone do not guarantee lower latency; performance also depends on the execution path and hardware backend.
 
-**3. Backend implementation significantly affects performance.**
-
-Additional experiments identified substantial execution overhead in the native MLA/Hybrid attention paths on Apple MPS.
-
-Numerically equivalent diagnostic implementations using matrix multiplication and explicit softmax reduced this overhead.
-
-These findings suggest that further optimization of the attention kernels could improve inference performance without changing the underlying architecture.
-
-The detailed performance investigation, correctness checks, and limitations are documented in the [Experimental Report](esperimenti/REPORT.md).
-
----
-
-## Reproducibility
-
-The repository includes scripts for evaluating model quality, benchmarking inference performance, and generating experimental reports.
-
-The main experimental scripts are located in `esperimenti/`.
-
-With the required dependencies, prepared dataset, and trained checkpoints available, a new benchmark campaign can be executed using:
-
-```bash
-RUN=esperimenti/confronto_nuovo
-
-python esperimenti/benchmark.py --output "$RUN" --device mps
-python esperimenti/metadata.py "$RUN"
-python esperimenti/evaluate.py "$RUN" --device mps
-python esperimenti/crea_report.py "$RUN"
-```
-
-The evaluation scripts collect inference measurements, model metadata, language modeling metrics, and memory statistics.
-
-The reporting script generates tables and figures from the saved experimental results.
-
-The commands above assume an appropriately configured Python environment. MPS benchmarking requires an Apple device with a supported GPU.
-
-For exact environment information, detailed configurations, and experimental artifacts, see the [Experimental Report](esperimenti/REPORT.md).
-
----
-
-## Limitations
-
-The experiments are intended to compare these attention implementations under controlled, resource-constrained conditions.
-
-Several limitations should be considered:
-
-- Models were trained and evaluated on a small character-level dataset.
-- Only one training run was performed per architecture.
-- Performance measurements were conducted on Apple M1 using the MPS backend.
-- Results may differ significantly on CUDA GPUs or other hardware.
-- The models have small parameter counts and a maximum context length of 256 tokens.
-- The attention implementations differ in positional encoding and execution paths.
-- The current MLA/Hybrid prefill implementation uses dense attention score computation with masking rather than an optimized sparse local-attention kernel.
-
-Consequently, the results characterize the behavior of these specific implementations and should not be interpreted as establishing the general superiority of one attention architecture.
+For larger models and longer contexts, memory savings could become more valuable and potentially offset some computational overhead. Further experiments are needed to establish whether this translates into faster inference.
 
 ---
 
@@ -384,3 +303,50 @@ The implementation and evaluation are based on the following works:
 3. **Mistral 7B**  
    Describes the use of Sliding Window Attention in a decoder-only language model.  
    [Paper](https://arxiv.org/abs/2310.06825)
+
+---
+
+## Reproducibility
+
+The commands below generate the benchmark data and figures shown above. Run them from the repository root with PyTorch, NumPy, and Matplotlib installed. Each benchmark requires `--device cpu`, `--device mps`, or `--device cuda`; MPS requires a supported Apple device and CUDA requires a CUDA-capable NVIDIA GPU. The commands below select the devices used for the published results. To measure on another device, change `--device`, use a new run directory, and pass its `benchmark_<device>` subdirectory to the cache plot command. Device-specific plots are saved with the device in their filenames. Keep the same Python and PyTorch versions, thread count, random seed, checkpoints, and dataset to reproduce measurements closely; timing results can still vary with system load.
+
+Prepare the character-level Shakespeare dataset and train all four models with the configuration used in this project. This writes checkpoints under `out/<attention_type>/`.
+
+```bash
+python data/shakespeare_char/prepare.py
+python train_all.py --dataset shakespeare_char --device mps --max_iters 6000 --eval_iters 20 --sliding_window 64 --tensorboard
+```
+
+The three benchmark entry points below follow the results sections above. The first covers Language Modeling Performance and KV Cache Memory; the other two measure Inference Performance and End-to-end autoregressive generation. Each command runs its measurements, saves the data in its run directory, and generates the corresponding figure in `figure/`. Use a new directory for each run.
+
+```bash
+python experiments/benchmark_language_modeling.py --run experiments/run_language_modeling --device mps
+```
+
+Run the dense inference measurements used by Figure 3. This campaign measures prompt lengths 16–240 in steps of four, with a 64-token window, four rounds of ten samples, and the selected device.
+
+```bash
+python experiments/benchmark_inference.py --run experiments/run_inference_cpu --device cpu --window 64 --rounds 4 --warmups 5 --repetitions 10
+```
+
+Run cached greedy generation for the two prompt lengths and four output lengths used in Figure 4. It uses four rounds, two warm-ups, and four timed samples per case.
+
+```bash
+python experiments/benchmark_generation.py --run experiments/run_generation --device mps --rounds 4 --warmups 2 --repetitions 4 --context-batch 8
+```
+
+To regenerate figures separately from completed campaigns, pass the relevant run directories to the plotting helper:
+
+```bash
+python experiments/utils/plot_readme.py cache experiments/run_language_modeling/benchmark_mps --evaluation experiments/run_language_modeling/evaluation.json --output figure
+python experiments/utils/plot_readme.py inference experiments/run_inference_cpu --output figure
+python experiments/utils/plot_readme.py generation experiments/run_generation --output figure
+```
+
+To regenerate the published figures without rerunning measurements, run:
+
+```bash
+python experiments/utils/plot_readme.py cache experiments/confronto_20261016 --evaluation experiments/confronto_20261016/evaluation.json --output figure
+python experiments/utils/plot_readme.py inference experiments/confronto_cpu_step4_20261018 --output figure
+python experiments/utils/plot_readme.py generation experiments/extended_mps_20261018 --output figure
+```
