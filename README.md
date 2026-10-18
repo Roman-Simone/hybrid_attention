@@ -308,45 +308,29 @@ The implementation and evaluation are based on the following works:
 
 ## Reproducibility
 
-The commands below generate the benchmark data and figures shown above. Run them from the repository root with PyTorch, NumPy, and Matplotlib installed. Each benchmark requires `--device cpu`, `--device mps`, or `--device cuda`; MPS requires a supported Apple device and CUDA requires a CUDA-capable NVIDIA GPU. The commands below select the devices used for the published results. To measure on another device, change `--device`, use a new run directory, and pass its `benchmark_<device>` subdirectory to the cache plot command. Device-specific plots are saved with the device in their filenames. Keep the same Python and PyTorch versions, thread count, random seed, checkpoints, and dataset to reproduce measurements closely; timing results can still vary with system load.
+Run these commands from the repository root. Benchmarks save their results under `--run` and automatically generate plots in `figure/`. Use a new run directory for each execution.
 
-Prepare the character-level Shakespeare dataset and train all four models with the configuration used in this project. This writes checkpoints under `out/<attention_type>/`.
+**Training:** prepare the Shakespeare character-level dataset and train all four architectures.
 
 ```bash
 python data/shakespeare_char/prepare.py
-python train_all.py --dataset shakespeare_char --device mps --max_iters 6000 --eval_iters 20 --sliding_window 64 --tensorboard
+python train_all.py --dataset shakespeare_char --device mps --max_iters 6000 --sliding_window 64
 ```
 
-The three benchmark entry points below follow the results sections above. The first covers Language Modeling Performance and KV Cache Memory; the other two measure Inference Performance and End-to-end autoregressive generation. Each command runs its measurements, saves the data in its run directory, and generates the corresponding figure in `figure/`. Use a new directory for each run.
+**Language modeling and KV cache:** evaluate cross-entropy, perplexity, bits per character, and cache memory usage.
 
 ```bash
 python experiments/benchmark_language_modeling.py --run experiments/run_language_modeling --device mps
 ```
 
-Run the dense inference measurements used by Figure 3. This campaign measures prompt lengths 16–240 in steps of four, with a 64-token window, four rounds of ten samples, and the selected device.
+**Inference:** measure prefill latency, cached decoding latency, and throughput on CPU.
 
 ```bash
-python experiments/benchmark_inference.py --run experiments/run_inference_cpu --device cpu --window 64 --rounds 4 --warmups 5 --repetitions 10
+python experiments/benchmark_inference.py --run experiments/run_inference_cpu --device cpu
 ```
 
-Run cached greedy generation for the two prompt lengths and four output lengths used in Figure 4. It uses four rounds, two warm-ups, and four timed samples per case.
+**Generation:** benchmark cached autoregressive generation and evaluate modeling quality at different context lengths.
 
 ```bash
-python experiments/benchmark_generation.py --run experiments/run_generation --device mps --rounds 4 --warmups 2 --repetitions 4 --context-batch 8
-```
-
-To regenerate figures separately from completed campaigns, pass the relevant run directories to the plotting helper:
-
-```bash
-python experiments/utils/plot_readme.py cache experiments/run_language_modeling/benchmark_mps --evaluation experiments/run_language_modeling/evaluation.json --output figure
-python experiments/utils/plot_readme.py inference experiments/run_inference_cpu --output figure
-python experiments/utils/plot_readme.py generation experiments/run_generation --output figure
-```
-
-To regenerate the published figures without rerunning measurements, run:
-
-```bash
-python experiments/utils/plot_readme.py cache experiments/confronto_20261016 --evaluation experiments/confronto_20261016/evaluation.json --output figure
-python experiments/utils/plot_readme.py inference experiments/confronto_cpu_step4_20261018 --output figure
-python experiments/utils/plot_readme.py generation experiments/extended_mps_20261018 --output figure
+python experiments/benchmark_generation.py --run experiments/run_generation --device mps
 ```
