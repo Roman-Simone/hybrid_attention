@@ -238,6 +238,8 @@ The shaded bands show the interquartile range (IQR); overlapping ranges call for
 *Figure 3. Inference performance of MHA, MLA, SWA, and Hybrid on the Apple M1 CPU (4 threads, batch size 1, float32). From left to right, the panels show prefill latency, single-token latency with a fixed cache, and average latency per token over 16 consecutive decoding steps. Prompt lengths are sampled every 4 tokens from 16 to 240. Lines connect measured medians and shaded bands show the interquartile range. The dotted line marks the 64-token window. At 240 tokens, SWA has the lowest median prefill and decode latency.*
 </center>
 
+**Note on the inference backend:** preliminary tests on MPS showed unexpectedly high latency for some operations in the MLA and Hybrid inference paths. The timing benchmarks reported here were therefore run on CPU, using the same settings for all four models, to avoid drawing conclusions from MPS behavior.
+
 ### KV Cache Memory
 
 One of the main objectives of the Hybrid architecture is to reduce persistent KV cache memory.
@@ -273,17 +275,17 @@ However, these savings do not automatically translate into faster inference. In 
 
 The main advantages and drawbacks observed in these experiments are:
 
-**Pros**
+**Advantages**
 
-- **Lower KV cache memory:** combining latent compression and a sliding window reduces cache storage by a factor of 22.5 compared with MHA at 240 tokens.
-- **Comparable modeling quality:** validation metrics remain close to the baseline on Shakespeare character-level data.
-- **Bounded cache growth:** SWA and Hybrid stop accumulating cached tokens once the attention window is full.
+- **MLA:** demostrate to use less cache memory while keeping access to the full available context.
+- **SWA:** demostrate to keep cache memory bounded and provides good inference speed in these tests.
+- **Hybrid:** achieves the largest cache savings while keeping modeling quality close to MHA.
 
-**Cons**
+**Drawbacks**
 
-- **Small quality tradeoff:** the alternative architectures achieve slightly worse validation metrics than MHA in the reported comparison.
-- **Higher prefill latency:** MLA-based models take longer to process the initial prompt in the current implementation.
-- **Implementation-dependent speed:** smaller caches alone do not guarantee lower latency; performance also depends on the execution path and hardware backend.
+- **MLA and Hybrid:** take longer to process the initial prompt in this implementation.
+- **SWA and Hybrid:** limit each layer’s direct access to distant tokens.
+- **All alternatives:** produce slightly worse validation results than MHA.
 
 For larger models and longer contexts, memory savings could become more valuable and potentially offset some computational overhead. Further experiments are needed to establish whether this translates into faster inference.
 
