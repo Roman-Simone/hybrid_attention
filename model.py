@@ -1,8 +1,10 @@
 """
-The code take inspiration from the code creaated from these three repo:
-- https://github.com/deepseek-ai/DeepSeek-V3.git - nanoGPT
-- https://github.com/mistralai/mistral-inference.git - for SLA
-- https://github.com/karpathy/nanoGPT.git - for MLA
+Transformer implementation adapted from nanoGPT, with attention inspired by:
+- https://github.com/karpathy/nanoGPT - decoder-only Transformer and MHA
+- https://github.com/deepseek-ai/DeepSeek-V3 - MLA
+- https://github.com/mistralai/mistral-inference - SWA
+
+See THIRD_PARTY_NOTICES.md for the nanoGPT license.
 """
 import inspect
 import math

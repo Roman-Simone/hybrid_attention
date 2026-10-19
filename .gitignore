@@ -3,6 +3,7 @@
 *.pkl
 *.pt
 *.txt
+!requirements.txt
 /reference/nanoGPT
 out/
 experiments/*/

@@ -340,10 +340,12 @@ def main():
                seed=1337,rounds=args.rounds,warmups=args.warmups,repetitions=args.repetitions,
                lengths=args.lengths,decode_steps=16,variants=VARIANTS,
                environment={k:v for k,v in os.environ.items() if k.startswith(('PYTORCH_','OMP_','MKL_'))})
-    try:
-        env['hardware'] = subprocess.check_output(['/usr/sbin/sysctl','-n','machdep.cpu.brand_string','hw.memsize','hw.model'],text=True).splitlines()
-    except subprocess.CalledProcessError:
-        env['hardware'] = 'not available'
+    env['hardware'] = platform.platform()
+    if sys.platform == 'darwin':
+        try:
+            env['hardware'] = subprocess.check_output(['/usr/sbin/sysctl','-n','machdep.cpu.brand_string','hw.memsize','hw.model'],text=True).splitlines()
+        except (OSError, subprocess.CalledProcessError):
+            pass
     dump(out/'environment.json',env)
     dump(out/'source_hashes.json',{str(p.relative_to(ROOT)):sha(p) for p in [Path(__file__).resolve(),ROOT/'model.py',*sorted((ROOT/'attention').glob('*.py'))]})
     commands = []

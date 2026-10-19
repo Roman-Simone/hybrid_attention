@@ -48,7 +48,11 @@ def protected_manifest(run):
 
 
 def memory_snapshot(device):
-    snapshot = dict(process_peak_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # macOS reports bytes; Linux reports KiB.
+    if sys.platform == 'linux':
+        peak_rss *= 1024
+    snapshot = dict(process_peak_rss_bytes=peak_rss)
     if device == 'mps':
         snapshot.update(tensor_bytes=torch.mps.current_allocated_memory(),
                         driver_bytes=torch.mps.driver_allocated_memory())
